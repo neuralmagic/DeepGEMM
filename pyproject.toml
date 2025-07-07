@@ -1,17 +1,26 @@
 [project]
 name = "deep-gemm"
-version = "1.0.0"
+dynamic = ["version"]
 description = "DeepSeek GEMM Kernels"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "setuptools",
     "torch>=2.1",
 ]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools-scm]
+write_to = "deep_gemm/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deep_gemm*"]
+
+[tool.setuptools.package-data]
+deep_gemm = ["include/**/*"]
 
 [tool.ruff]
 line-length = 88

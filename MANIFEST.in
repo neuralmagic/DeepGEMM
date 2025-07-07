@@ -1,12 +1,8 @@
-include README.md
-include LICENSE
-include pyproject.toml
-include setup.py
-include CMakeLists.txt
-recursive-include deep_gemm *.py
-recursive-include deep_gemm/include *.cuh *.h *.hpp
-recursive-include third-party/cutlass/include/cute *.hpp *.h
-recursive-include third-party/cutlass/include/cutlass *.hpp *.h *.cuh
-global-exclude *.pyc
-global-exclude __pycache__
-global-exclude .git*
+include README.md LICENSE pyproject.toml
+recursive-include deep_gemm *.py *.cuh *.h *.hpp
+recursive-include third-party/cutlass/include *.hpp *.h *.cuh
+prune third-party/cutlass/test
+prune third-party/cutlass/examples
+prune third-party/cutlass/docs
+prune third-party/cutlass/media
+global-exclude *.pyc __pycache__ .git*

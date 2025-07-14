@@ -1,5 +1,5 @@
-import os
 import setuptools
+import os
 import shutil
 import subprocess
 from setuptools import find_packages

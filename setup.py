@@ -1,13 +1,10 @@
-import setuptools
 import os
 import shutil
-import subprocess
-from setuptools import find_packages
+from setuptools import setup
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-jit_include_dirs = ('deep_gemm/include/deep_gemm', )
 third_party_include_dirs = (
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -72,25 +69,7 @@ class CustomBuildPy(build_py):
 
 
 if __name__ == '__main__':
-    # noinspection PyBroadException
-    try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-    except:
-        revision = ''
-
-    setuptools.setup(
-        name='deep_gemm',
-        version='1.1.0' + revision,
-        packages=find_packages('.'),
-        package_data={
-            'deep_gemm': [
-                'include/deep_gemm/**/*',
-                'include/cute/**/*',
-                'include/cutlass/**/*',
-            ]
-        },
-        zip_safe=False,
+    setup(
         cmdclass={
             'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,

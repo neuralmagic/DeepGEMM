@@ -20,7 +20,14 @@ where = ["."]
 include = ["deep_gemm*"]
 
 [tool.setuptools.package-data]
-deep_gemm = ["include/**/*"]
+deep_gemm = [
+    "include/deep_gemm/**/*",
+    "include/cute/**/*", 
+    "include/cutlass/**/*"
+]
+
+[tool.setuptools]
+zip-safe = false
 
 [tool.ruff]
 line-length = 88

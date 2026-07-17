@@ -25,6 +25,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool use_fp8_weights;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -70,6 +71,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -87,7 +89,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.use_fp8_weights ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -110,7 +113,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm100_fp8_fp4_mega_moe(
+static void sm100_mega_moe_launch(
     const torch::Tensor& y,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
@@ -123,7 +126,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_fp8_weights
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -199,6 +203,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .use_fp8_weights = use_fp8_weights,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -218,9 +223,56 @@ static void sm100_fp8_fp4_mega_moe(
                                   config.smem_size, 2)
     };
 
+    const auto kernel_name = use_fp8_weights ? "sm100_fp8_mega_moe" : "sm100_fp8_fp4_mega_moe";
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    const auto runtime = compiler->build(kernel_name, code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+}
+
+static void sm100_fp8_fp4_mega_moe(
+    const torch::Tensor& y,
+    const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
+    const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
+    const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
+    const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts_per_rank,
+    const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const float& activation_clamp,
+    const bool& fast_math
+) {
+    sm100_mega_moe_launch(y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                          l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+                          cumulative_local_expert_recv_stats, sym_buffer_ptrs,
+                          rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
+                          num_tokens, num_topk, hidden, intermediate_hidden,
+                          activation_clamp, fast_math, false);
+}
+
+static void sm100_fp8_mega_moe(
+    const torch::Tensor& y,
+    const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
+    const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
+    const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
+    const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts_per_rank,
+    const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const float& activation_clamp,
+    const bool& fast_math
+) {
+    sm100_mega_moe_launch(y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                          l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+                          cumulative_local_expert_recv_stats, sym_buffer_ptrs,
+                          rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
+                          num_tokens, num_topk, hidden, intermediate_hidden,
+                          activation_clamp, fast_math, true);
 }
 
 } // namespace deep_gemm

@@ -108,6 +108,19 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+def transform_weights_for_fp8_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    # FP8 weights: same interleave gate/up layout as FP4, plus UTCCP SF transpose.
+    l1_w = _interleave_weights(l1_weights[0])
+    l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+    l1_transformed = (l1_w, l1_sf)
+    # L2: only transpose SF for UTCCP.
+    l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
+    return l1_transformed, l2_transformed
+
+
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -119,6 +132,29 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
     _C.fp8_fp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (1, 1, 32),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    _C.fp8_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,

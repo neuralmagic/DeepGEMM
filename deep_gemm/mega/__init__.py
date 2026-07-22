@@ -119,7 +119,7 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
                        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                        activation_clamp: Optional[float] = None,
                        fast_math: bool = True):
-    from ..utils.math import unpack_ue8m0_from_int
+    from ..utils.math import unpack_ue8m0_from_int, per_token_cast_to_fp8
 
     num_tokens = y.shape[0]
     hidden = y.shape[1]
@@ -138,56 +138,97 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
     intermediate_hidden = l2_w.shape[2]
     num_topk = topk_idx.shape[1]
 
-    x_sf_fp32 = unpack_ue8m0_from_int(x_sf_packed)
-    x_dequant = x_fp8.float() * x_sf_fp32.repeat_interleave(32, dim=1)[:, :hidden]
+    # Dequant FP8 activations to BF16 (per-32 UE8M0 → per-128 FP32 requant needed for SM90 GEMM)
+    x_sf = unpack_ue8m0_from_int(x_sf_packed)
+    x_bf16 = (x_fp8.float() * x_sf.repeat_interleave(32, dim=1)[:, :hidden]).bfloat16()
 
-    def _dequant_expert_weight(w_fp8_e, w_sf_e):
-        n, k = w_fp8_e.shape
-        if w_sf_e.dtype == torch.int32:
-            sf = unpack_ue8m0_from_int(w_sf_e)
-        else:
-            sf = w_sf_e
-        sf_n, sf_k = sf.shape
-        if sf_n < n:
-            sf = sf.repeat_interleave(n // sf_n, dim=0)[:n]
-        if sf_k < k:
-            sf = sf.repeat_interleave(k // sf_k, dim=1)[:, :k]
-        return w_fp8_e.float() * sf
+    # Flatten topk assignments and filter valid ones
+    flat_topk_idx = topk_idx.reshape(-1)
+    flat_token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_topk).reshape(-1)
+    flat_wts = topk_wts.reshape(-1)
 
+    valid = (flat_topk_idx >= 0) & (flat_topk_idx < num_experts_per_rank)
+    valid_expert_idx = flat_topk_idx[valid]
+    valid_token_idx = flat_token_idx[valid]
+    valid_wts = flat_wts[valid]
+    num_valid = valid_expert_idx.shape[0]
+
+    if num_valid == 0:
+        y.zero_()
+        if cumulative_local_expert_recv_stats is not None:
+            cumulative_local_expert_recv_stats.zero_()
+        return
+
+    # Sort by expert to create grouped layout
+    sorted_indices = torch.argsort(valid_expert_idx, stable=True)
+    sorted_expert_idx = valid_expert_idx[sorted_indices]
+    sorted_token_idx = valid_token_idx[sorted_indices]
+    sorted_wts = valid_wts[sorted_indices]
+
+    # Expert token counts
+    expert_counts = torch.zeros(num_experts_per_rank, dtype=torch.int32, device=device)
+    bc = torch.bincount(sorted_expert_idx.int(), minlength=num_experts_per_rank)
+    expert_counts[:bc.shape[0]] = bc[:num_experts_per_rank].int()
+
+    mk_alignment = _C.get_theoretical_mk_alignment_for_contiguous_layout()
+    _C.set_mk_alignment_for_contiguous_layout(mk_alignment)
+
+    # Build psum-style grouped layout with alignment padding between experts
+    aligned_counts = ((expert_counts + mk_alignment - 1) // mk_alignment * mk_alignment)
+    aligned_counts = aligned_counts * (expert_counts > 0).int()
+    cum_aligned = torch.zeros(num_experts_per_rank + 1, dtype=torch.int32, device=device)
+    cum_aligned[1:] = aligned_counts.cumsum(0)
+    expert_starts = cum_aligned[:-1]
+    total_aligned = cum_aligned[-1].item()
+
+    # psum grouped_layout[e] = start_of_expert_e + count_of_expert_e
+    grouped_layout = (expert_starts + expert_counts).int()
+
+    # Map sorted token positions to aligned data array positions
+    cum_counts = expert_counts.cumsum(0)
+    expert_start_in_sorted = (cum_counts - expert_counts).long()
+    within_pos = torch.arange(num_valid, device=device) - expert_start_in_sorted[sorted_expert_idx.long()]
+    aligned_positions = expert_starts[sorted_expert_idx.long()].long() + within_pos
+
+    # Gather activations and requant to FP8 with per-128 scales (SM90 format)
+    gathered_bf16 = torch.zeros((total_aligned, hidden), dtype=torch.bfloat16, device=device)
+    gathered_bf16[aligned_positions] = x_bf16[sorted_token_idx]
+    gathered_fp8, gathered_sf = per_token_cast_to_fp8(gathered_bf16, use_ue8m0=False, gran_k=128)
+
+    # L1 grouped GEMM: FP8 activations × FP8 weights → BF16
+    l1_out = torch.empty((total_aligned, intermediate_hidden_x2), dtype=torch.bfloat16, device=device)
+    _C.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (gathered_fp8, gathered_sf), l1_weights, l1_out, grouped_layout,
+        disable_ue8m0_cast=True, use_psum_layout=True)
+
+    # SwiGLU activation on valid positions only
+    l1_valid = l1_out[aligned_positions]
+    gate = l1_valid[:, :intermediate_hidden_x2 // 2]
+    up = l1_valid[:, intermediate_hidden_x2 // 2:]
+
+    if activation_clamp is not None and activation_clamp < float('inf'):
+        gate = gate.clamp(max=activation_clamp)
+        up = up.clamp(-activation_clamp, activation_clamp)
+
+    activated = torch.nn.functional.silu(gate) * up
+    activated = (activated * sorted_wts.unsqueeze(1)).bfloat16()
+
+    # Requant intermediate to FP8 for L2 GEMM
+    act_padded = torch.zeros((total_aligned, intermediate_hidden), dtype=torch.bfloat16, device=device)
+    act_padded[aligned_positions] = activated
+    act_fp8, act_sf = per_token_cast_to_fp8(act_padded, use_ue8m0=False, gran_k=128)
+
+    # L2 grouped GEMM: FP8 intermediate × FP8 weights → BF16
+    l2_out = torch.empty((total_aligned, hidden), dtype=torch.bfloat16, device=device)
+    _C.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (act_fp8, act_sf), l2_weights, l2_out, grouped_layout,
+        disable_ue8m0_cast=True, use_psum_layout=True)
+
+    # Scatter results back weighted by topk
     y.zero_()
-
-    for e in range(num_experts_per_rank):
-        mask = (topk_idx == e)
-        if not mask.any():
-            continue
-        token_indices, topk_positions = mask.nonzero(as_tuple=True)
-        expert_wts = topk_wts[token_indices, topk_positions]
-        expert_x = x_dequant[token_indices]
-
-        l1_w_e = _dequant_expert_weight(l1_w[e], l1_w_sf[e])
-        l1_out = expert_x @ l1_w_e.T
-
-        gate = l1_out[:, :intermediate_hidden_x2 // 2]
-        up = l1_out[:, intermediate_hidden_x2 // 2:]
-
-        if activation_clamp is not None and activation_clamp < float('inf'):
-            gate = gate.clamp(max=activation_clamp)
-            up = up.clamp(-activation_clamp, activation_clamp)
-
-        activated = torch.nn.functional.silu(gate) * up
-        activated = activated * expert_wts.unsqueeze(1)
-
-        l2_w_e = _dequant_expert_weight(l2_w[e], l2_w_sf[e])
-        l2_out = activated @ l2_w_e.T
-
-        y.index_add_(0, token_indices, l2_out.bfloat16())
+    y.index_add_(0, sorted_token_idx, l2_out[aligned_positions])
 
     if cumulative_local_expert_recv_stats is not None:
-        expert_counts = torch.zeros(num_experts_per_rank, dtype=torch.int, device=device)
-        valid_idx = topk_idx[(topk_idx >= 0) & (topk_idx < num_experts_per_rank)]
-        if valid_idx.numel() > 0:
-            bc = torch.bincount(valid_idx.int(), minlength=num_experts_per_rank)
-            expert_counts[:bc.shape[0]] = bc[:num_experts_per_rank].int()
         cumulative_local_expert_recv_stats.copy_(expert_counts.cumsum(0).int())
 
 

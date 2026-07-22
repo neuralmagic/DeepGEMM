@@ -211,22 +211,22 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
         (gathered_fp8, gathered_sf), l1_weights, l1_out, grouped_layout,
         disable_ue8m0_cast=True, use_psum_layout=True)
 
-    # Fused SwiGLU + requant: compute in float32, skip BF16 intermediate, cast directly to FP8
-    gate = l1_out[:, :intermediate_hidden].float()
-    up = l1_out[:, intermediate_hidden:].float()
+    # SwiGLU in BF16, then requant to FP8 with per-128 block scales
+    gate = l1_out[:, :intermediate_hidden]
+    up = l1_out[:, intermediate_hidden:]
 
     if activation_clamp is not None and activation_clamp < float('inf'):
-        gate = gate.clamp(max=activation_clamp)
-        up = up.clamp(-activation_clamp, activation_clamp)
+        gate = gate.float().clamp(max=activation_clamp).bfloat16()
+        up = up.float().clamp(-activation_clamp, activation_clamp).bfloat16()
 
-    act_f32 = torch.nn.functional.silu(gate) * up
+    act_bf16 = torch.nn.functional.silu(gate) * up
     padded_ih = (intermediate_hidden + 127) // 128 * 128
     if padded_ih != intermediate_hidden:
-        act_padded = torch.zeros((total_aligned, padded_ih), dtype=torch.float32, device=device)
-        act_padded[:, :intermediate_hidden] = act_f32
+        act_f32 = torch.zeros((total_aligned, padded_ih), dtype=torch.float32, device=device)
+        act_f32[:, :intermediate_hidden] = act_bf16.float()
     else:
-        act_padded = act_f32
-    act_view = act_padded.view(total_aligned, -1, 128)
+        act_f32 = act_bf16.float()
+    act_view = act_f32.view(total_aligned, -1, 128)
     act_sf = act_view.abs().amax(dim=2).clamp(1e-4) / 448.0
     act_fp8 = (act_view * (1.0 / act_sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(total_aligned, padded_ih)[:, :intermediate_hidden].contiguous()
 

@@ -201,22 +201,18 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
         (gathered_fp8, gathered_sf), l1_weights, l1_out, grouped_layout,
         disable_ue8m0_cast=True, use_psum_layout=True)
 
-    # SwiGLU activation on valid positions only
-    l1_valid = l1_out[aligned_positions]
-    gate = l1_valid[:, :intermediate_hidden_x2 // 2]
-    up = l1_valid[:, intermediate_hidden_x2 // 2:]
+    # SwiGLU on full padded array (zero rows → silu(0)*0=0, harmless for requant)
+    gate = l1_out[:, :intermediate_hidden]
+    up = l1_out[:, intermediate_hidden:]
 
     if activation_clamp is not None and activation_clamp < float('inf'):
         gate = gate.clamp(max=activation_clamp)
         up = up.clamp(-activation_clamp, activation_clamp)
 
-    activated = torch.nn.functional.silu(gate) * up
-    activated = (activated * sorted_wts.unsqueeze(1)).bfloat16()
+    act_bf16 = (torch.nn.functional.silu(gate) * up).bfloat16()
 
     # Requant intermediate to FP8 for L2 GEMM
-    act_padded = torch.zeros((total_aligned, intermediate_hidden), dtype=torch.bfloat16, device=device)
-    act_padded[aligned_positions] = activated
-    act_fp8, act_sf = per_token_cast_to_fp8(act_padded, use_ue8m0=False, gran_k=128)
+    act_fp8, act_sf = per_token_cast_to_fp8(act_bf16, use_ue8m0=False, gran_k=128)
 
     # L2 grouped GEMM: FP8 intermediate × FP8 weights → BF16
     l2_out = torch.empty((total_aligned, hidden), dtype=torch.bfloat16, device=device)
@@ -226,7 +222,8 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
 
     # Scatter results back weighted by topk
     y.zero_()
-    y.index_add_(0, sorted_token_idx, l2_out[aligned_positions])
+    sorted_wts_bf16 = sorted_wts.unsqueeze(1).bfloat16()
+    y.index_add_(0, sorted_token_idx, l2_out[aligned_positions] * sorted_wts_bf16)
 
     if cumulative_local_expert_recv_stats is not None:
         cumulative_local_expert_recv_stats.copy_(expert_counts.cumsum(0).int())

@@ -119,7 +119,7 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
                        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                        activation_clamp: Optional[float] = None,
                        fast_math: bool = True):
-    from ..utils.math import unpack_ue8m0_from_int, per_token_cast_to_fp8
+    from ..utils.math import unpack_ue8m0_from_int
 
     num_tokens = y.shape[0]
     hidden = y.shape[1]
@@ -138,9 +138,9 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
     intermediate_hidden = l2_w.shape[2]
     num_topk = topk_idx.shape[1]
 
-    # Dequant FP8 activations to BF16 (per-32 UE8M0 → per-128 FP32 requant needed for SM90 GEMM)
+    # Unpack per-32 UE8M0 scales (used after gather to avoid dequanting all tokens)
     x_sf = unpack_ue8m0_from_int(x_sf_packed)
-    x_bf16 = (x_fp8.float() * x_sf.repeat_interleave(32, dim=1)[:, :hidden]).bfloat16()
+    num_sf_groups = hidden // 32
 
     # Flatten topk assignments and filter valid ones
     flat_topk_idx = topk_idx.reshape(-1)
@@ -190,10 +190,20 @@ def _sm90_fp8_mega_moe(y: torch.Tensor,
     within_pos = torch.arange(num_valid, device=device) - expert_start_in_sorted[sorted_expert_idx.long()]
     aligned_positions = expert_starts[sorted_expert_idx.long()].long() + within_pos
 
-    # Gather activations and requant to FP8 with per-128 scales (SM90 format)
-    gathered_bf16 = torch.zeros((total_aligned, hidden), dtype=torch.bfloat16, device=device)
-    gathered_bf16[aligned_positions] = x_bf16[sorted_token_idx]
-    gathered_fp8, gathered_sf = per_token_cast_to_fp8(gathered_bf16, use_ue8m0=False, gran_k=128)
+    # Gather FP8 bytes and per-32 scales, then rescale to per-128 (avoids BF16 intermediate)
+    gathered_fp8_raw = torch.zeros((total_aligned, hidden), dtype=torch.float8_e4m3fn, device=device)
+    gathered_fp8_raw[aligned_positions] = x_fp8[sorted_token_idx]
+    gathered_sf32 = torch.zeros((total_aligned, num_sf_groups), dtype=torch.float32, device=device)
+    gathered_sf32[aligned_positions] = x_sf[:, :num_sf_groups][sorted_token_idx]
+
+    # Convert per-32 scales to per-128: max of 4 adjacent per-32 scales
+    sf32_view = gathered_sf32.view(total_aligned, -1, 4)
+    gathered_sf = sf32_view.amax(dim=2).clamp(min=1e-4)
+
+    # Rescale FP8 values from per-32 to per-128 scale domain
+    ratios = sf32_view / gathered_sf.unsqueeze(2)
+    fp8_view = gathered_fp8_raw.float().view(total_aligned, -1, 4, 32)
+    gathered_fp8 = (fp8_view * ratios.unsqueeze(3)).to(torch.float8_e4m3fn).reshape(total_aligned, hidden)
 
     # L1 grouped GEMM: FP8 activations × FP8 weights → BF16
     l1_out = torch.empty((total_aligned, intermediate_hidden_x2), dtype=torch.bfloat16, device=device)

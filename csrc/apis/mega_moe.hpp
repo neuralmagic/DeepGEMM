@@ -8,12 +8,10 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 
-#if DG_TENSORMAP_COMPATIBLE
-#include "../jit/compiler.hpp"
-#endif
-#include "../jit/device_runtime.hpp"
+#include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 
 namespace deep_gemm::mega {
 
@@ -42,12 +40,12 @@ get_symm_buffer_size_for_mega_moe(
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu" or (mma_type == "fp8xfp4" and activation == "situ"));
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_sms = runtime->get_num_sms();
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
@@ -170,8 +168,8 @@ static void fp8_fp4_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const std::optional<float>& situ_beta_opt,
-    const std::optional<float>& situ_linear_beta_opt
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -184,29 +182,28 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
-    const auto use_situ = activation == "situ";
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
-    const auto situ_beta = situ_beta_opt.value_or(0.0f);
-    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
-    DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value());
-    DG_HOST_ASSERT(not use_situ or
-                   (std::isfinite(situ_beta) and situ_beta > 0 and
-                    std::isfinite(situ_linear_beta) and situ_linear_beta > 0));
-    DG_HOST_ASSERT(use_situ or
-                   (not situ_beta_opt.has_value() and not situ_linear_beta_opt.has_value()));
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
+    if (activation == "situ") {
+        DG_HOST_ASSERT(activation_alpha > 0);
+        // Zero represents FlashInfer's optional, unset situ_linear_beta.
+        DG_HOST_ASSERT(activation_beta >= 0);
+    }
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+    const auto weight_dtype = l1_weights.scalar_type();
+    DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
@@ -258,7 +255,8 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xfp4", activation, num_shared_experts
+        weight_dtype == torch::kFloat8_e4m3fn ? "fp8xfp8" : "fp8xfp4",
+        activation, num_shared_experts
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
@@ -270,31 +268,39 @@ static void fp8_fp4_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp8_fp4_mega_moe(y,
-                               l1_acts, l1_acts_sf,
-                               l2_acts, l2_acts_sf,
-                               shared_l1_acts, shared_l1_acts_sf,
-                               shared_l2_acts, shared_l2_acts_sf,
-                               l1_weights, l2_weights,
-                               l1_weights_sf, l2_weights_sf,
-                               shared_l1_weights, shared_l2_weights,
-                               shared_l1_weights_sf, shared_l2_weights_sf,
-                               cumulative_local_expert_recv_stats,
-                               sym_buffer_ptrs,
-                               rank_idx, num_max_tokens_per_rank,
-                               num_experts_per_rank,
-                               num_shared_experts,
-                               num_tokens, num_topk,
-                               hidden, intermediate_hidden,
-                               activation_clamp, fast_math,
-                               use_situ, situ_beta, situ_linear_beta);
+        const auto launch = [&](const auto kernel, const auto&... activation_args) {
+            kernel(y,
+                   l1_acts, l1_acts_sf,
+                   l2_acts, l2_acts_sf,
+                   shared_l1_acts, shared_l1_acts_sf,
+                   shared_l2_acts, shared_l2_acts_sf,
+                   l1_weights, l2_weights,
+                   l1_weights_sf, l2_weights_sf,
+                   shared_l1_weights, shared_l2_weights,
+                   shared_l1_weights_sf, shared_l2_weights_sf,
+                   cumulative_local_expert_recv_stats,
+                   sym_buffer_ptrs,
+                   rank_idx, num_max_tokens_per_rank,
+                   num_experts_per_rank,
+                   num_shared_experts,
+                   num_tokens, num_topk,
+                   hidden, intermediate_hidden,
+                   activation_args...);
+        };
+        if (activation == "situ") {
+            launch(sm100_fp8_fp4_mega_moe_situ,
+                   activation_alpha, activation_beta, fast_math);
+        } else {
+            launch(sm100_fp8_fp4_mega_moe,
+                   activation_clamp, activation_alpha, activation_beta, fast_math);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
     // Zero the entire symmetric buffer for debug mode
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 
@@ -311,7 +317,9 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -322,11 +330,13 @@ static void bf16_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = get_shape<3>(l1_weights);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
     DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
@@ -395,25 +405,24 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, activation_alpha, activation_beta,
+                            fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
     // Zero the entire symmetric buffer for debug mode
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 
 static void register_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
-#endif
 }
 
 } // namespace deep_gemm::mega

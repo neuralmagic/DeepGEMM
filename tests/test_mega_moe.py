@@ -73,6 +73,8 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    assert args.activation != 'situ' or args.mma_type != 'bf16xbf16', \
+        'SiTU is only supported by the FP8/FP4 Mega MoE kernel path'
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -95,16 +97,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        activation=args.activation
     )
 
-    # Cast weights into FP4
+    # Cast routed weights into FP4 or FP8
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
         w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
         for i in range(num_groups):
             w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
+    def _cast_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
+        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=32)
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
@@ -142,7 +154,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_l1_weights = shared_l2_weights = None
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            # FP8 path: cast inputs and weights with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
@@ -151,17 +163,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            l1_weights = _cast_weights_to_fp4(l1_weights)
-            l2_weights = _cast_weights_to_fp4(l2_weights)
+            cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
+            l1_weights = cast_weights(l1_weights)
+            l2_weights = cast_weights(l2_weights)
             if num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
 
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe(
+                l1_weights, l2_weights, activation=args.activation))
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
+                deep_gemm.transform_weights_for_mega_moe(
+                    shared_l1_weights, shared_l2_weights, activation=args.activation))
         else:
             transformed_shared_l1_weights = transformed_shared_l2_weights = None
 
@@ -187,8 +202,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            activation=args.activation,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math))
+            fast_math=bool(args.fast_math),
+            activation_alpha=args.activation_alpha,
+            activation_beta=args.activation_beta)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -199,6 +217,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > Activation: type={args.activation}, limit={args.activation_clamp}, '
+               f'alpha={args.activation_alpha}, beta={args.activation_beta}',
+               once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -241,14 +262,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False, 'do_expand': True}
             gemm_fn = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
             gemm_kwargs = {'compiled_dims': '', 'use_psum_layout': True}
-            swiglu_kwargs = {'round_scale': False, 'ue8m0_scale': False, 'output_bf16': True}
+            activation_kwargs = {'round_scale': False, 'ue8m0_scale': False, 'output_bf16': True}
             get_num_tokens = lambda recv_x: recv_x.size(0)
         else:
             dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False,
                                'do_expand': True, 'use_tma_aligned_col_major_sf': True}
             gemm_fn = deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous
             gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, 32)}
-            swiglu_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
+            activation_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
             get_num_tokens = lambda recv_x: recv_x[0].size(0)
 
         def get_baseline_shared_bias() -> Optional[torch.Tensor]:
@@ -264,6 +285,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     avail_tokens=None,
                     num_per_channels=128, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                    activation=args.activation,
+                    alpha=args.activation_alpha, beta=args.activation_beta,
                     round_scale=False, ue8m0_scale=False, output_bf16=True)[-1]
                 deep_gemm.bf16_gemm_nt(l2_in, shared_l2_weights, y)
             else:
@@ -274,6 +297,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     avail_tokens=None,
                     num_per_channels=32, use_col_major_scales=True,
                     clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                    activation=args.activation,
+                    alpha=args.activation_alpha, beta=args.activation_beta,
                     round_scale=True, ue8m0_scale=True, output_bf16=False)
                 deep_gemm.fp8_gemm_nt(l2_in, shared_l2_weights, y, recipe=(1, 1, 32), disable_ue8m0_cast=True)
             return y
@@ -292,14 +317,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l1_y = torch.empty((num_recv_tokens, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
             gemm_fn(recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert, **gemm_kwargs)
 
-            # SwiGLU
-            swiglu_result = tilelang_ops.swiglu_apply_weight_to_fp8(
+            # Gated activation
+            activation_result = tilelang_ops.swiglu_apply_weight_to_fp8(
                 x=l1_y, topk_weights=recv_topk_weights,
                 avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
                 num_per_channels=32, use_col_major_scales=True,
                 clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
-                **swiglu_kwargs)
-            l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
+                activation=args.activation,
+                alpha=args.activation_alpha, beta=args.activation_beta,
+                **activation_kwargs)
+            l1_y = activation_result[-1] if is_bf16xbf16 else activation_result
 
             # L2 GEMM
             l2_y = torch.empty((num_recv_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -352,22 +379,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size = 2 if is_bf16xbf16 else 1
+    routed_weight_elem_size = 2 if is_bf16xbf16 else (1 if args.mma_type == 'fp8xfp8' else 0.5)
+    shared_weight_elem_size = 2 if is_bf16xbf16 else 1
     num_routed_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size      # L1 weights
-        + num_touched_experts * hidden * intermediate_hidden * weight_elem_size        # L2 weights
-        + num_recv_tokens * hidden * act_elem_size                                     # L1 acts read
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L1 output write
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L2 acts read
-        + num_recv_tokens * hidden * 2                                                 # L2 output write (always BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden * routed_weight_elem_size      # L1 weights
+        + num_touched_experts * hidden * intermediate_hidden * routed_weight_elem_size        # L2 weights
+        + num_recv_tokens * hidden * act_elem_size                                            # L1 acts read
+        + num_recv_tokens * intermediate_hidden * act_elem_size                               # L1 output write
+        + num_recv_tokens * intermediate_hidden * act_elem_size                               # L2 acts read
+        + num_recv_tokens * hidden * 2                                                        # L2 output write (always BF16)
     )
     num_shared_hbm_bytes = 0 if num_shared_experts == 0 else (
-        shared_intermediate_hidden * 2 * hidden * weight_elem_size      # Shared L1 weights
-        + hidden * shared_intermediate_hidden * weight_elem_size        # Shared L2 weights
-        + num_tokens * hidden * act_elem_size                           # Shared L1 acts read
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L1 output write
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L2 acts read
-        + num_tokens * hidden * 2                                       # Shared L2 output write
+        shared_intermediate_hidden * 2 * hidden * shared_weight_elem_size      # Shared L1 weights
+        + hidden * shared_intermediate_hidden * shared_weight_elem_size        # Shared L2 weights
+        + num_tokens * hidden * act_elem_size                                  # Shared L1 acts read
+        + num_tokens * shared_intermediate_hidden * act_elem_size              # Shared L1 output write
+        + num_tokens * shared_intermediate_hidden * act_elem_size              # Shared L2 acts read
+        + num_tokens * hidden * 2                                              # Shared L2 output write
     )
     num_hbm_bytes = num_routed_hbm_bytes + num_shared_hbm_bytes
 
@@ -417,12 +446,17 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')
-    parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
+    parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'situ'))
+    parser.add_argument('--activation-clamp', type=float, default=10, help='SwiGLU clamp value')
+    parser.add_argument('--activation-alpha', type=float, default=1.0,
+                        help='SwiGLU sigmoid scale or SiTU gate tanh scale')
+    parser.add_argument('--activation-beta', type=float, default=0.0,
+                        help='SwiGLU up bias or SiTU linear tanh scale (0 disables it)')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

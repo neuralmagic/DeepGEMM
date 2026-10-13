@@ -96,9 +96,8 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
         }
     } else {
-        // num_next_n_atoms is host-passed (NV PR #314): SM90 multicast wants 1 while
-        // SM120 next_n=4 wants 2; computing it inline (next_n / 2) over-schedules by
-        // 2x on SM90 and triggers IMA when the scheduler steps past context_lens.
+        // The host supplies this because SM90 next_n=4 uses one scheduler item
+        // backed by a two-CTA cluster, while other kernels may atomize next_n.
         const uint32_t total = sum * num_next_n_atoms;
         if (total == 0) {
             // Emit only one-past-the-end sentinels. Besides avoiding the
@@ -222,7 +221,7 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
         // Empty metadata ranges may carry the one-past-the-end sentinel (notably
-        // all-zero varlen context lengths). Do not dereference context_lens or
+        // all-zero context lengths). Do not dereference context_lens or
         // indices until this SM actually owns a task.
         current_advance = 1;
         current_num_kv = 0;

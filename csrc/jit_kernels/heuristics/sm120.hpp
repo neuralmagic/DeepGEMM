@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <vector>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 
@@ -15,8 +20,22 @@ struct SM120ArchSpec {
 
     static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
 
+    // The *byte-addressable* element size, used only to enumerate BLOCK_K / BLOCK_N
+    // candidates and to model TMA bytes. The real sub-byte SMEM footprint is computed
+    // per-dtype in `get_smem_bytes_per_k` below, which already halves packed FP4.
+    //
+    // NOTES: `nv_dev`'s SM120ArchSpec predates `MmaKind::MXF4` -- its `get_mma_kind()`
+    // classified every non-BF16 input as `MXFP8FP4` (1 byte), FP4 x FP4 included, and it
+    // called a now-removed `get_byte_addressable_element_size` from `common.hpp`. This
+    // preserves that classification: SM120 loads FP4 through its own `.b4x16_p64` path,
+    // so deriving 4 bits -> 0 bytes here would divide by zero. For the same reason
+    // `GemmDesc::get_smem_pack_factor()` (added for SM100) must *not* be applied on top.
+    static int get_byte_addressable_element_size(const MmaKind& mma_kind) {
+        return std::max(get_num_element_bits(mma_kind) / 8, 1);
+    }
+
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
-        const int elem_size = get_element_size(desc.get_mma_kind());
+        const int elem_size = get_byte_addressable_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
 
@@ -63,7 +82,7 @@ struct SM120ArchSpec {
         } else {
             int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
             for (int i = step; i <= 256; i += step) {
-                if ((i * get_element_size(desc.get_mma_kind())) % 64 != 0)
+                if ((i * elem_size) % 64 != 0)
                     continue;
                 block_n_candidates.push_back(i);
             }
@@ -206,9 +225,13 @@ struct SM120ArchSpec {
         const int num_stages = std::min(
             (smem_capacity - smem_extra) / smem_per_stage,
             kNumMaxStages);
-        return {
-            smem_extra + num_stages * smem_per_stage,
-            num_stages
+        return PipelineConfig {
+            .smem_size = smem_extra + num_stages * smem_per_stage,
+            .num_stages = num_stages,
+            // `dev` added this field after `nv_dev` forked; without an explicit
+            // initializer it would be indeterminate. 2 matches sm100's non-k-grouped
+            // value -- sm120 has no k-grouped TMA-store special case.
+            .num_tma_store_stages = 2,
         };
     }
 
@@ -242,7 +265,7 @@ struct SM120ArchSpec {
         const int64_t expected_k = desc.get_expected_k();
         const int k_blocks = ceil_div(static_cast<int>(expected_k), layout.block_k);
 
-        const int elem_size = get_element_size(desc.get_mma_kind());
+        const int elem_size = get_byte_addressable_element_size(desc.get_mma_kind());
         const int sf_bytes_a = (desc.kernel_type == KernelType::Kernel1D1D)
             ? align(layout.block_m * 4, 128) : 0;
         const int sf_bytes_b = (desc.kernel_type == KernelType::Kernel1D1D)
@@ -316,7 +339,18 @@ struct SM120ArchSpec {
         const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
         if (kSFTileKBlocks == 0)
             return 1;
-        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
+
+        // The split-K validity invariant, in one place so the search below and the
+        // post-clamp re-check can never drift apart.
+        const auto is_sf_aligned = [&](const int s) {
+            // A single partition spans all of K, so it has no interior boundary to
+            // misalign -- always valid, even when `num_k_blocks % kSFTileKBlocks != 0`.
+            if (s <= 1)
+                return true;
+            return num_k_blocks % s == 0 and (num_k_blocks / s) % kSFTileKBlocks == 0;
+        };
+
+        while (split_k > 1 and not is_sf_aligned(split_k))
             --split_k;
 
         split_k = std::min(split_k, num_k_blocks / (2 * kSFTileKBlocks));
@@ -326,7 +360,22 @@ struct SM120ArchSpec {
         if (mn_bytes > 0)
             split_k = std::min(split_k, std::max(static_cast<int>(kMaxWorkspaceBytes / mn_bytes), 1));
 
-        return std::max(split_k, 1);
+        // NOTES: deliberate divergence from `nv_dev`, which returns here. Both clamps
+        // above can lower `split_k` past the value the search settled on, onto one that
+        // no longer satisfies the invariant -- e.g. `num_k_blocks = 10`,
+        // `kSFTileKBlocks = 2`: the search lands on 5, then the first clamp yields
+        // `min(5, 10 / 4) = 2`, and `10 / 2 = 5` is not a multiple of 2, so partition 1
+        // would start mid-SF-tile. Re-establish the invariant instead of trusting it.
+        // Walking down is monotonically safe: a smaller factor can only cost
+        // performance, and `1` is always valid. `heuristics/sm120.hpp` is
+        // sm120-exclusive, so this divergence costs no rebase surface -- do not
+        // "restore" upstream's ordering here.
+        while (split_k > 1 and not is_sf_aligned(split_k))
+            --split_k;
+
+        split_k = std::max(split_k, 1);
+        DG_HOST_ASSERT(is_sf_aligned(split_k));
+        return split_k;
     }
 };
 

@@ -15,6 +15,14 @@ except Exception as exception:
 from .. import _C
 
 
+_SUPPORTED_ACTIVATIONS = ('swiglu', 'situ')
+
+
+def _validate_activation(activation: str) -> None:
+    assert activation in _SUPPORTED_ACTIVATIONS, \
+        f'Activation must be one of {_SUPPORTED_ACTIVATIONS}, got `{activation}`'
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -22,17 +30,24 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
-        assert activation == 'swiglu' or (mma_type == 'fp8xfp4' and activation == 'situ'), \
-            f'Only FP8xFP4 MegaMoE supports `situ`, got mma_type={mma_type!r}, activation={activation!r}'
+                 activation: str = 'swiglu',
+                 base: Optional['SymmBuffer'] = None):
+        # Align token count
+        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+        # Init
+        _validate_activation(activation)
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.num_shared_experts = num_shared_experts
+        self.mma_type = mma_type
+        self.activation = activation
 
-        # Allocate a symmetric buffer
+        # Allocate or reuse a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
@@ -40,16 +55,25 @@ class SymmBuffer:
             mma_type, activation,
             num_shared_experts
         )
-        allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
-        self.handle = (
-            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-            if group.size() == 1
-            else symm_mem.rendezvous(self.buffer, group=group)
-        )
-        self.buffer.zero_()
-        self.group.barrier()
-        torch.cuda.synchronize()
+        if base is None:
+            allocator = torch if group.size() == 1 else symm_mem
+            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+            self.handle = (
+                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+                if group.size() == 1
+                else symm_mem.rendezvous(self.buffer, group=group)
+            )
+            self.buffer.zero_()
+            self.group.barrier()
+            torch.cuda.synchronize()
+        else:
+            assert base.buffer is not None and base.handle is not None and base.group is group, \
+                'Cannot reuse an invalid symmetric buffer'
+            assert num_bytes <= base.buffer.nbytes, \
+                (f'The reused Mega MoE config requires {num_bytes} bytes, '
+                 f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
+            self.buffer = base.buffer
+            self.handle = base.handle
 
         # Create input buffer views
         (self.x, self.x_sf,
@@ -67,6 +91,7 @@ class SymmBuffer:
         self.x_sf = None
 
 
+# TODO: remove this function
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
@@ -75,9 +100,6 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu') -> SymmBuffer:
-    # Align token count
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
-
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -135,11 +157,9 @@ def transform_weights_for_mega_moe(
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation in ('swiglu', 'situ'), f'Unsupported activation: {activation!r}'
-    assert activation != 'situ' or (isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)), \
-        '`situ` requires FP8xFP4 `(weight, sf)` tuples for both L1 and L2 weights'
+    _validate_activation(activation)
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
         l1_transformed = (l1_w, l1_sf)
@@ -164,8 +184,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
-                     situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     activation_alpha: float = 1.0,
+                     activation_beta: float = 0.0):
+    _validate_activation(activation)
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -178,7 +199,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        situ_beta, situ_linear_beta
+        activation_alpha, activation_beta
     )
 
 def bf16_mega_moe(y: torch.Tensor,
@@ -190,7 +211,11 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  activation_alpha: float = 1.0,
+                  activation_beta: float = 0.0):
+    assert activation == 'swiglu', \
+        f'BF16 Mega MoE only supports `swiglu`, got `{activation}`'
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -205,5 +230,6 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        activation_alpha, activation_beta
     )

@@ -189,9 +189,18 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         idx_storage_t kv_block_idx_storage;
 
         while (fetched_next_task) {
+            // Prefetch next Q when current Q changes
+            bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(next_q_idx + 1));
             q_idx = next_q_idx;
             kv_idx = next_kv_idx;
             num_kv = next_num_kv;
+
+            // Wait Q consumer release and issue TMA Q
+            if (prefetch_q) {
+                CUTE_TIE_DECL(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
+                empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
+                issue_tma_q(q_stage_idx, q_idx + 1);
+            }
 
             // Read KV block index
             // TODO: deal with `-1`?
@@ -231,14 +240,6 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Fetch next task
             fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv);
-            // Drive Q prefetch from the scheduler's actual next task. The
-            // scheduler may skip zero-context requests, so q_idx + 1 is not
-            // necessarily the next Q consumed by the math warp-groups.
-            if (fetched_next_task and q_idx != next_q_idx) {
-                CUTE_TIE_DECL(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
-                empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
-                issue_tma_q(q_stage_idx, next_q_idx);
-            }
         }
     } else {
         // Math warp-groups for WGMMA

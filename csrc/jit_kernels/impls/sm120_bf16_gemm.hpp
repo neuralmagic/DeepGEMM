@@ -1,26 +1,28 @@
 #pragma once
 
+#include <algorithm>
+#include <format>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
+#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
 
-class SM120BF16GemmRuntime final: public LaunchRuntime<SM120BF16GemmRuntime> {
+class SM120BF16GemmRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
         const std::optional<std::string> epilogue_type;
+        int64_t stride_cd_m;
+        int64_t stride_cd_batch;
 
         void* gmem_d;
         void* gmem_c;
@@ -33,12 +35,12 @@ public:
         CUtensorMap tensor_map_cd;
     };
 
-    static std::string generate_impl(const Args& args) {
+    static void compile_and_launch(const std::string& tag, const Args& args) {
         // kNWarps: BM=64 needs kNWarps=2 (kMWarps=4); BM=128 uses default
         // kNWarps=kNumMathWarps (all warps along M, original layout).
         const uint32_t block_m = args.gemm_config.layout.block_m;
         const uint32_t k_n_warps = (block_m % 64 == 0 and block_m < 128) ? 2u : 1u;
-        return fmt::format(R"(
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm120_bf16_gemm.cuh>
 
 using namespace deep_gemm;
@@ -75,18 +77,22 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
-        k_n_warps);
-    }
+        k_n_warps));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        // Launch
+        // NOTES: `epilogue_type_t` is a template-only parameter of `sm120_bf16_gemm_impl`
+        //        (it carries no runtime state there), so no epilogue argument is launched.
+        jit->launch(
+            kernel, args.options,
             args.gmem_d, args.gmem_c,
             args.gmem_a_ptr, args.gmem_b_ptr,
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+            args.stride_cd_m, args.stride_cd_batch,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_cd));
+            args.tensor_map_cd
+        );
     }
 };
 
@@ -107,13 +113,13 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
-    const auto cd = c.value_or(d);
+    const auto& cd = d;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -126,16 +132,22 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                 config.layout.block_m, config.layout.block_n,
-                                                n, 1,
+                                                static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_bf16_gemm", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -145,10 +157,7 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_bf16_gemm", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
@@ -176,8 +185,8 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
@@ -200,13 +209,19 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_m_grouped_bf16_gemm_contiguous", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -216,10 +231,7 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_m_grouped_bf16_gemm_contiguous", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
@@ -240,8 +252,8 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
@@ -262,13 +274,19 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_m_grouped_bf16_gemm_masked", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = n,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -278,10 +296,7 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_m_grouped_bf16_gemm_masked", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
@@ -326,14 +341,14 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
     // Allocate tensor map buffer for dynamic replacement (A + B per SM)
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_sms = runtime->get_num_sms();
     const auto tensor_map_buffer = torch::empty(
         {num_sms * 2 * static_cast<int>(sizeof(CUtensorMap))},
         a.options().dtype(torch::kByte));
@@ -358,13 +373,20 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
                                                 config.layout.block_m, config.layout.block_n,
                                                 n, num_groups,
                                                 config.storage_config.swizzle_cd_mode);
-    const auto cd = c.value_or(d);
-    const SM120BF16GemmRuntime::Args args = {
+    const auto& cd = d;
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_bf16_k_grouped_gemm", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size, 1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = d.stride(-2),
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a_km.data_ptr(),
@@ -374,10 +396,7 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_bf16_k_grouped_gemm", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
@@ -393,8 +412,8 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(), .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
@@ -411,13 +430,19 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_bf16_bhr_hdr_bhd", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = tensor_d.stride(0),
+        .stride_cd_batch = tensor_d.stride(1),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -427,10 +452,7 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_bf16_bhr_hdr_bhd", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
@@ -448,8 +470,8 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::MN,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(), .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 
@@ -469,13 +491,19 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM120BF16GemmRuntime::compile_and_launch("sm120_bf16_bhd_hdr_bhr", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
         .epilogue_type = std::nullopt,
+        .stride_cd_m = tensor_d.stride(0),
+        .stride_cd_batch = tensor_d.stride(1),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -485,10 +513,7 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_bf16_bhd_hdr_bhr", code);
-    SM120BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 } // namespace deep_gemm
